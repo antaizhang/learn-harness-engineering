@@ -6,3 +6,11 @@
 - 初始化脚本
 - 进度文件
 - 首次运行脚手架
+
+## 运行示例
+
+示例用 Python 编写，无需第三方依赖（会检查当前目录的初始化前置条件）：
+
+```sh
+python3 docs/zh/lectures/lecture-06-why-initialization-needs-its-own-phase/code/init_check.py
+```
