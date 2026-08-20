@@ -6,3 +6,11 @@
 - 运行时状态可见性
 - 干净状态检查
 - 恢复示例
+
+## 运行示例
+
+示例用 Python 编写，无需第三方依赖：
+
+```sh
+python3 docs/zh/lectures/lecture-09-why-agents-declare-victory-too-early/code/victory_detector.py
+```

@@ -5,3 +5,11 @@
 - 单体式指令文件
 - 短小入口文件
 - 渐进式信息披露模式
+
+## 运行示例
+
+示例用 Python 编写，无需第三方依赖：
+
+```sh
+python3 docs/zh/lectures/lecture-04-why-one-giant-instruction-file-fails/code/split_vs_monolithic.py
+```

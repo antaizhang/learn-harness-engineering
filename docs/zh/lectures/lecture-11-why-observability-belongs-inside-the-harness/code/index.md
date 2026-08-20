@@ -6,3 +6,11 @@
 - 评估者评分标准
 - 生成器/评估者循环
 - 单 Agent 与多角色对比
+
+## 运行示例
+
+示例用 Python 编写，无需第三方依赖：
+
+```sh
+python3 docs/zh/lectures/lecture-11-why-observability-belongs-inside-the-harness/code/runtime_logger.py
+```
