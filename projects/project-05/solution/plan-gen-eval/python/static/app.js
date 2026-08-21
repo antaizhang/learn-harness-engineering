@@ -1,0 +1,422 @@
+/*
+ * Renderer logic -- vanilla-JS port of src/renderer (App.tsx + components).
+ *
+ * `knowledgeBase` mirrors the Electron preload contextBridge API
+ * (src/preload/preload.ts): the same method shape, backed by fetch calls to
+ * the Flask `/api/*` routes that stand in for the IPC channels.
+ */
+
+const api = {
+  async _json(method, url, body) {
+    const opts = { method, headers: {} };
+    if (body !== undefined) {
+      opts.headers['Content-Type'] = 'application/json';
+      opts.body = JSON.stringify(body);
+    }
+    const res = await fetch(url, opts);
+    return res.json();
+  },
+};
+
+const knowledgeBase = {
+  documents: {
+    list: () => api._json('GET', '/api/documents'),
+    import: (filePath) => api._json('POST', '/api/documents/import', { filePath }),
+    importFile: async (file) => {
+      const fd = new FormData();
+      fd.append('file', file);
+      const res = await fetch('/api/documents/import', { method: 'POST', body: fd });
+      return res.json();
+    },
+    get: (id) => api._json('GET', `/api/documents/${id}`),
+    delete: (id) => api._json('DELETE', `/api/documents/${id}`),
+  },
+  indexing: {
+    start: (documentId) => api._json('POST', '/api/indexing/start', { documentId }),
+    status: () => api._json('GET', '/api/indexing/status'),
+    chunks: (documentId) => api._json('GET', `/api/indexing/chunks/${documentId}`),
+  },
+  qa: {
+    ask: (question) => api._json('POST', '/api/qa/ask', { question }),
+    history: () => api._json('GET', '/api/qa/history'),
+    clearHistory: () => api._json('POST', '/api/qa/clear-history'),
+  },
+  conversation: {
+    get: () => api._json('GET', '/api/conversation'),
+  },
+};
+
+// --- Application state (mirrors App.tsx useState hooks) ---
+const state = {
+  documents: [],
+  selectedDoc: null,
+  appStatus: { documentsLoaded: 0, indexStatus: 'idle', lastActivity: '' },
+  lastResponse: null,
+  showChunks: false,
+  chunks: [],
+  conversationHistory: [],
+  activeTab: 'documents',
+};
+
+// --- Helpers ---
+const $ = (id) => document.getElementById(id);
+const esc = (s) =>
+  String(s).replace(/[&<>"']/g, (c) =>
+    ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+function toast(message) {
+  let el = $('toast');
+  if (!el) {
+    el = document.createElement('div');
+    el.id = 'toast';
+    el.style.cssText =
+      'position:fixed;bottom:48px;left:50%;transform:translateX(-50%);' +
+      'background:#0f3460;color:#e0e0e0;padding:8px 16px;border-radius:6px;' +
+      'font-size:12px;border:1px solid #533483;z-index:1000;opacity:0;transition:opacity .2s;';
+    document.body.appendChild(el);
+  }
+  el.textContent = message;
+  el.style.opacity = '1';
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => { el.style.opacity = '0'; }, 2600);
+}
+
+// --- Rendering ---
+function renderDocumentList() {
+  const list = $('document-list');
+  $('doc-count').textContent = state.documents.length;
+  if (state.documents.length === 0) {
+    list.innerHTML =
+      '<div class="doc-empty">No documents imported yet.<br>' +
+      '<span class="hint">Import documents to get started.</span></div>';
+    return;
+  }
+  list.innerHTML = state.documents
+    .map((doc) => {
+      const selected = state.selectedDoc && state.selectedDoc.id === doc.id ? ' selected' : '';
+      const check = doc.status === 'indexed' ? '✓ ' : '';
+      const kb = (doc.size / 1024).toFixed(1);
+      return (
+        `<div class="doc-card${selected}" data-id="${doc.id}">` +
+        `<div class="doc-title">${esc(doc.title)}</div>` +
+        `<div class="doc-meta">${check}${kb} KB</div></div>`
+      );
+    })
+    .join('');
+  list.querySelectorAll('.doc-card').forEach((card) => {
+    card.addEventListener('click', () => {
+      const doc = state.documents.find((d) => d.id === card.dataset.id);
+      selectDocument(doc);
+    });
+  });
+}
+
+function renderDetail() {
+  const area = $('detail-area');
+  const parts = [];
+  const doc = state.selectedDoc;
+  if (doc) {
+    const rows = [
+      `<div>Filename: ${esc(doc.filename)}</div>`,
+      `<div>Imported: ${new Date(doc.importedAt).toLocaleString()}</div>`,
+      `<div>Size: ${(doc.size / 1024).toFixed(1)} KB</div>`,
+      `<div>Status: ${esc(doc.status)}</div>`,
+    ];
+    if (doc.chunks !== undefined) rows.push(`<div>Chunks: ${doc.chunks}</div>`);
+
+    let actions =
+      `<button class="btn btn-secondary" id="toggle-chunks">` +
+      `${state.showChunks ? 'Hide' : 'Show'} Chunks (${state.chunks.length})</button>`;
+    if (doc.status !== 'indexed') {
+      actions += `<button class="btn btn-primary" id="index-doc">Index Document</button>`;
+    }
+
+    let chunksHtml = '';
+    if (state.showChunks) {
+      chunksHtml = state.chunks
+        .map(
+          (chunk) =>
+            `<div class="chunk"><div class="chunk-head">Chunk ${chunk.index} ` +
+            `(${chunk.metadata.charCount} chars)</div>${esc(chunk.content)}</div>`
+        )
+        .join('');
+    }
+
+    parts.push(
+      `<div class="detail"><h2>${esc(doc.title)}</h2>` +
+      `<div class="detail-meta">${rows.join('')}</div>` +
+      `<div class="detail-actions">${actions}</div>${chunksHtml}</div>`
+    );
+  } else {
+    parts.push('<div class="placeholder">Select a document or ask a question to get started</div>');
+  }
+
+  if (state.lastResponse) {
+    const r = state.lastResponse;
+    let citations = '';
+    if (r.citations.length > 0) {
+      citations =
+        '<div class="citations"><strong>Citations:</strong>' +
+        r.citations
+          .map(
+            (c) =>
+              `<div class="citation">${esc(c.documentTitle)} (chunk ${c.chunkIndex}): ` +
+              `${esc(c.excerpt.substring(0, 100))}...</div>`
+          )
+          .join('') +
+        '</div>';
+    }
+    parts.push(
+      `<div class="answer-block"><div class="answer-text">${esc(r.answer)}</div>${citations}</div>`
+    );
+  }
+
+  area.innerHTML = parts.join('');
+
+  const toggle = $('toggle-chunks');
+  if (toggle) toggle.addEventListener('click', () => { state.showChunks = !state.showChunks; renderDetail(); });
+  const indexBtn = $('index-doc');
+  if (indexBtn)
+    indexBtn.addEventListener('click', async () => {
+      await knowledgeBase.indexing.start(doc.id);
+      state.chunks = await knowledgeBase.indexing.chunks(doc.id);
+      renderDetail();
+    });
+}
+
+function renderStatusBar() {
+  const s = state.appStatus;
+  const colors = { idle: '#888', indexing: '#f0ad4e', ready: '#5cb85c', error: '#d9534f' };
+  $('status-dot').style.background = colors[s.indexStatus] || '#888';
+  $('status-index').textContent = s.indexStatus == null ? '' : s.indexStatus;
+  $('status-docs').textContent = s.documentsLoaded == null ? '' : s.documentsLoaded;
+  $('status-activity').textContent = s.lastActivity
+    ? `Last activity: ${new Date(s.lastActivity).toLocaleTimeString()}`
+    : '';
+}
+
+// --- Actions (mirror App.tsx callbacks) ---
+async function refreshDocuments() {
+  try {
+    state.documents = await knowledgeBase.documents.list();
+    state.appStatus = await knowledgeBase.indexing.status();
+    if (state.selectedDoc) {
+      state.selectedDoc = state.documents.find((d) => d.id === state.selectedDoc.id) || null;
+    }
+    renderDocumentList();
+    renderDetail();
+    renderStatusBar();
+  } catch (err) {
+    console.error('Failed to refresh documents:', err);
+  }
+}
+
+async function selectDocument(doc) {
+  state.selectedDoc = doc;
+  state.showChunks = false;
+  state.chunks = await knowledgeBase.indexing.chunks(doc.id);
+  renderDocumentList();
+  renderDetail();
+}
+
+// In P1 the renderer import is a stub -- a real app would open a file dialog.
+function handleImport() {
+  console.log('Import triggered - use window.knowledgeBase.documents.import(filePath)');
+  toast('Import triggered - drive it via the API: POST /api/documents/import');
+}
+
+async function handleAskQuestion(question) {
+  try {
+    state.lastResponse = await knowledgeBase.qa.ask(question);
+    renderDetail();
+    await refreshHistory();
+  } catch (err) {
+    console.error('Q&A failed:', err);
+  }
+}
+
+async function refreshHistory() {
+  try {
+    state.conversationHistory = await knowledgeBase.conversation.get();
+    $('conv-count').textContent = state.conversationHistory.length;
+    if (state.activeTab === 'conversation') renderConversation();
+  } catch (err) {
+    console.error('Failed to refresh conversation history:', err);
+  }
+}
+
+function switchTab(tab) {
+  state.activeTab = tab;
+  $('tab-documents').classList.toggle('active', tab === 'documents');
+  $('tab-conversation').classList.toggle('active', tab === 'conversation');
+  $('documents-tab').style.display = tab === 'documents' ? '' : 'none';
+  $('conversation-tab').style.display = tab === 'conversation' ? '' : 'none';
+  if (tab === 'conversation') renderConversation();
+}
+
+// ConversationHistory -- Planner + Generator + Evaluator implementation.
+// Full-featured: chat bubbles, date separators, expandable citations,
+// copy-to-clipboard, confidence, and "ask follow-up" suggestions.
+const convUi = { expandedCitations: new Set(), copiedId: null };
+
+function dateStrOf(ts) {
+  return new Date(ts).toLocaleDateString([], { month: 'short', day: 'numeric' });
+}
+
+function generateSuggestions(item) {
+  const keywords = item.question.toLowerCase().split(/\s+/).filter((w) => w.length > 3);
+  let suggestions;
+  if (keywords.some((k) => k.includes('design') || k.includes('architecture'))) {
+    suggestions = [
+      'What design patterns are used in the services layer?',
+      'How does the preload bridge ensure security?',
+    ];
+  } else if (keywords.some((k) => k.includes('import') || k.includes('document'))) {
+    suggestions = ['What file formats are supported for import?', 'How are imported documents stored?'];
+  } else if (keywords.some((k) => k.includes('index') || k.includes('chunk'))) {
+    suggestions = ['What is the chunk size used for indexing?', 'How does keyword matching rank chunks?'];
+  } else {
+    suggestions = [
+      'Tell me more about the document indexing process',
+      'What documents are available for search?',
+    ];
+  }
+  return suggestions.slice(0, 2);
+}
+
+function renderConversation() {
+  const el = $('conversation-tab');
+  const history = state.conversationHistory;
+  if (history.length === 0) {
+    el.innerHTML =
+      '<div class="conv-empty"><div class="conv-empty-icon">&#128172;</div>' +
+      '<div class="conv-empty-title">No conversation history</div>' +
+      '<span class="conv-empty-hint">Ask a question to start a conversation.</span></div>';
+    return;
+  }
+
+  el.innerHTML = history
+    .map((item, i) => {
+      const time = new Date(item.response.timestamp);
+      const timeStr = time.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+      const dateStr = dateStrOf(item.response.timestamp);
+      const showDate = i === 0 || dateStr !== dateStrOf(history[i - 1].response.timestamp);
+      const isExpanded = convUi.expandedCitations.has(i);
+      const isCopied = convUi.copiedId === i;
+      const cites = item.response.citations;
+
+      const dateSep = showDate ? `<div class="conv-date"><span>${esc(dateStr)}</span></div>` : '';
+
+      let citeBlock = '';
+      if (cites.length > 0) {
+        const arrow = isExpanded ? 'expanded' : '';
+        let list = '';
+        if (isExpanded) {
+          list =
+            '<div class="cite-list">' +
+            cites
+              .map(
+                (c) =>
+                  `<div class="cite"><span class="cite-title">${esc(c.documentTitle)}</span>` +
+                  `<span class="cite-chunk"> (chunk ${c.chunkIndex})</span><br>` +
+                  `${esc(c.excerpt.substring(0, 120))}...</div>`
+              )
+              .join('') +
+            '</div>';
+        }
+        citeBlock =
+          `<div class="cite-toggle-wrap"><button class="cite-toggle" data-toggle="${i}">` +
+          `<span class="cite-arrow ${arrow}">&#9654;</span>${cites.length} citation(s)</button>${list}</div>`;
+      }
+
+      const actionRow =
+        '<div class="bubble-actions">' +
+        `<button class="copy-btn" data-copy="${i}">${isCopied ? 'Copied!' : 'Copy'}</button>` +
+        `<span class="conf">Confidence: ${Math.round(item.response.confidence * 100)}%</span></div>`;
+
+      let followUps = '';
+      if (i === history.length - 1) {
+        followUps =
+          '<div class="followups"><div class="followups-label">Suggested follow-ups:</div>' +
+          generateSuggestions(item)
+            .map((s) => `<button class="followup" data-followup="${esc(s)}">${esc(s)}</button>`)
+            .join('') +
+          '</div>';
+      }
+
+      return (
+        '<div class="conv-turn">' +
+        dateSep +
+        `<div class="bubble-row right"><div class="bubble user">${esc(item.question)}</div></div>` +
+        `<div class="bubble-row left"><div class="bubble assistant">${esc(item.response.answer)}` +
+        citeBlock +
+        actionRow +
+        '</div></div>' +
+        `<div class="bubble-time">${timeStr}</div>` +
+        followUps +
+        '</div>'
+      );
+    })
+    .join('');
+
+  wireConversationEvents();
+}
+
+function wireConversationEvents() {
+  const el = $('conversation-tab');
+  el.querySelectorAll('[data-toggle]').forEach((btn) =>
+    btn.addEventListener('click', () => {
+      const idx = Number(btn.dataset.toggle);
+      if (convUi.expandedCitations.has(idx)) convUi.expandedCitations.delete(idx);
+      else convUi.expandedCitations.add(idx);
+      renderConversation();
+    })
+  );
+  el.querySelectorAll('[data-copy]').forEach((btn) =>
+    btn.addEventListener('click', () => {
+      const idx = Number(btn.dataset.copy);
+      const text = state.conversationHistory[idx].response.answer;
+      const done = () => {
+        convUi.copiedId = idx;
+        renderConversation();
+        setTimeout(() => {
+          convUi.copiedId = null;
+          if (state.activeTab === 'conversation') renderConversation();
+        }, 1500);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done).catch(done);
+      } else {
+        done();
+      }
+    })
+  );
+  el.querySelectorAll('[data-followup]').forEach((btn) =>
+    btn.addEventListener('click', () => handleAskQuestion(btn.dataset.followup))
+  );
+}
+
+// --- Wire up ---
+function init() {
+  $('refresh-btn').addEventListener('click', () => {
+    refreshDocuments();
+    refreshHistory();
+  });
+  $('import-btn').addEventListener('click', handleImport);
+  $('tab-documents').addEventListener('click', () => switchTab('documents'));
+  $('tab-conversation').addEventListener('click', () => switchTab('conversation'));
+  $('question-form').addEventListener('submit', (e) => {
+    e.preventDefault();
+    const input = $('question-input');
+    const q = input.value.trim();
+    if (!q) return;
+    handleAskQuestion(q);
+    input.value = '';
+  });
+  // Expose the bridge for console-driven use, mirroring window.knowledgeBase.
+  window.knowledgeBase = knowledgeBase;
+  refreshDocuments();
+  refreshHistory();
+}
+
+document.addEventListener('DOMContentLoaded', init);

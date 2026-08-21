@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Knowledge Base</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <div id="root">
+    <!-- App shell (mirrors src/renderer/App.tsx) -->
+    <header class="app-header">
+      <h1>Knowledge Base</h1>
+      <button id="refresh-btn" class="btn btn-refresh">Refresh</button>
+    </header>
+
+    <div class="app-body">
+      <!-- Left panel: Document list -->
+      <aside class="doc-panel">
+        <div class="doc-panel-head">
+          <span class="doc-panel-title">Documents (<span id="doc-count">0</span>)</span>
+          <button id="import-btn" class="btn btn-import">+ Import</button>
+        </div>
+        <div id="document-list" class="document-list"></div>
+      </aside>
+
+      <!-- Right panel: Document detail + Q&A -->
+      <main class="main-panel">
+        <div id="detail-area" class="detail-area">
+          <div class="placeholder">Select a document or ask a question to get started</div>
+        </div>
+        <form id="question-form" class="question-panel">
+          <input id="question-input" type="text"
+                 placeholder="Ask a question about your documents..." autocomplete="off" />
+          <button type="submit" class="btn btn-ask">Ask</button>
+        </form>
+      </main>
+    </div>
+
+    <!-- Status bar -->
+    <div class="status-bar" id="status-bar">
+      <span><span class="status-dot" id="status-dot"></span>Index: <span id="status-index">idle</span></span>
+      <span>Documents: <span id="status-docs">0</span></span>
+      <span id="status-activity"></span>
+    </div>
+  </div>
+
+  <!-- Hidden file input used by the Import button (later projects wire real upload) -->
+  <input id="file-input" type="file" accept=".txt,.md" style="display:none" />
+
+  <script src="/static/app.js"></script>
+</body>
+</html>
